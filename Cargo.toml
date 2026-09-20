@@ -1,0 +1,13 @@
+[package]
+name = "uclip_daemon"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+wayland-client = "0.31.15"
+wayland-protocols = { version = "0.32.13", features = ["client", "staging"] }
+nix = "0.31.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+anyhow = "1"
