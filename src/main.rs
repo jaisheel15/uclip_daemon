@@ -10,7 +10,7 @@ fn setup_connection() -> anyhow::Result<(Connection, EventQueue<AppState>, AppSt
     let qh = event_queue.handle();
     let _registry = display.get_registry(&qh, ());
 
-    let mut state = AppState::new();
+    let mut state: AppState = AppState::new();
 
     // Two roundtrips guarantee the initial registry globals (seat, manager)
     // have all arrived before we bind. A single blocking_dispatch may return

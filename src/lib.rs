@@ -4,7 +4,9 @@ pub mod display;
 pub mod error;
 pub mod mime;
 
-pub use clipboard::history::{ClipState, ClipboardEntry};
+pub use clipboard::history::{
+    ClipState, ClipboardContent, ClipboardEntry, ImageData, MixedData, TextData,
+};
 pub use clipboard::io::{ReadOutcome, drain_pending_reads};
 pub use clipboard::state::{AppState, OfferData, PendingRead, SourceData};
 pub use config::{

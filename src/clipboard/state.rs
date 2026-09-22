@@ -232,35 +232,45 @@ impl AppState {
 
     /// Publish a history entry back to the compositor as the active selection.
     ///
-    /// Contract: looks up `entry_id`, builds a [`SourceData`] with the entry's
-    /// MIME plus text aliases, offers each MIME, calls `set_selection`, then
-    /// destroys the previously owned source (no selection gap).
+    /// Contract: looks up `entry_id`, re-offers its exact stored
+    /// representations (plus text-alias fallbacks), calls `set_selection`,
+    /// then destroys the previously owned source (no selection gap).
     /// Errors when the entry/manager/device is missing — callers (future UI
     /// "paste"/"restore" action, e.g. `UiRequest::Restore { entry_id }` sent to
     /// the Wayland thread with the `QueueHandle`) should surface these, not unwrap.
     pub fn restore_entry(&mut self, entry_id: u64, qh: &QueueHandle<Self>) -> Result<()> {
         // Clone out of the history first so later `&mut self` borrows
         // (replace/destroy of `current_source`) don't fight the lookup borrow.
-        let (content, mime_type, found_id) = {
+        let (mut contents, has_text, found_id) = {
             let entry = self
                 .clipboard
                 .get(entry_id)
                 .ok_or(ClipboardError::EntryNotFound(entry_id))?;
-            (entry.content.clone(), entry.mime_type.clone(), entry.id)
+            (
+                entry.content.representations(),
+                entry.content.has_text(),
+                entry.id,
+            )
         };
 
         let manager = self.manager.as_ref().ok_or(ClipboardError::NoManager)?;
         let device = self.device.as_ref().ok_or(ClipboardError::NoDevice)?;
 
         // Per-mime contents so `Send` can serve the exact requested type.
-        // Text entries get common aliases pointing at the same bytes.
-        let mut contents: HashMap<String, Vec<u8>> = HashMap::new();
-        contents.insert(mime_type.clone(), content.clone());
-        if is_text_mime(&mime_type) {
+        // Top up missing text aliases with the primary text payload so
+        // legacy clients (`TEXT`, `STRING`, …) still paste even when the
+        // original copy offered only `text/plain`.
+        if has_text {
+            let fallback = contents
+                .get("text/plain;charset=utf-8")
+                .or_else(|| contents.get("text/plain"))
+                .or_else(|| contents.values().next())
+                .cloned()
+                .unwrap_or_default();
             for alias in TEXT_ALIASES {
                 contents
                     .entry((*alias).to_string())
-                    .or_insert_with(|| content.clone());
+                    .or_insert_with(|| fallback.clone());
             }
         }
 

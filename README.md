@@ -2,7 +2,7 @@
 
 Wayland clipboard monitor / history daemon using `ext_data_control_v1`.
 
-Listens for clipboard selections, reads up to `MAX_MIMES_PER_SELECTION` MIME payloads per copy over pipes, stores them in a bounded in-memory history (`MAX_HISTORY`), and can publish a history entry back as the active selection via `restore_entry`.
+Listens for clipboard selections, reads up to `MAX_MIMES_PER_SELECTION` MIME payloads per copy over pipes, groups them into one typed history entry (`Text` / `Image` / `Mixed` in `ClipboardContent`), stores them in a bounded in-memory history (`MAX_HISTORY`), and can publish a history entry back as the active selection via `restore_entry`.
 
 ## Requirements
 
@@ -28,7 +28,7 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-14 unit tests: `mime::pick_mimes`, `history::ClipState`, `io::drain_pending_reads` (incl. bounded truncation).
+21 unit tests: `mime::pick_mimes`, `history::ClipState` (typed Text/Image/Mixed, single-entry grouping), `io::drain_pending_reads` (incl. bounded truncation).
 
 ## Configuration
 
@@ -53,7 +53,7 @@ src/error.rs          thiserror ClipboardError (NoSeat/NoManager/NoDevice/EntryN
 src/mime.rs           is_text_mime + pick_mimes (single source of truth)
 src/display.rs        format_entry / format_new_entry / format_history
 src/clipboard/
-  history.rs          ClipboardEntry + ClipState (private fields, shallow consecutive-dedup)
+  history.rs          ClipboardContent (Text/TextData + Image/ImageData + Mixed/MixedData) + ClipboardEntry + ClipState (add_grouped: one copy == one entry, consecutive-dedup)
   state.rs            AppState (private fields + accessors, OfferData/SourceData/PendingRead)
   io.rs               drain_pending_reads -> Vec<ReadOutcome>, bounded reads, tracing only
   wayland/
@@ -76,7 +76,7 @@ Key invariants:
 state.restore_entry(entry_id, &qh)?;
 ```
 
-Looks up the entry, builds `SourceData` with its MIME plus `TEXT_ALIASES` for text, offers each MIME, calls `set_selection`, then destroys the previous source (no selection gap). Errors as `ClipboardError::EntryNotFound / NoManager / NoDevice`. Intended UI message: `UiRequest::Restore { entry_id }` to the Wayland thread.
+Looks up the entry, re-offers its exact stored representations (plus `TEXT_ALIASES` top-up for text), offers each MIME, calls `set_selection`, then destroys the previous source (no selection gap). Errors as `ClipboardError::EntryNotFound / NoManager / NoDevice`. Intended UI message: `UiRequest::Restore { entry_id }` to the Wayland thread.
 
 ## Logging
 

@@ -30,8 +30,8 @@ pub const SUPPORTED_BINARY_MIMES: &[&str] = &["image/png", "image/jpeg", "image/
 
 /// Maximum MIME transfers requested per selection (bounds pipe usage).
 ///
-/// One copy == up to N pipe round-trips + N history rows; raise with care
-/// if the UI ever groups rows per copy.
+/// One copy == up to N pipe round-trips grouped into ONE history entry;
+/// raise with care since each transfer still costs a pipe + read.
 pub const MAX_MIMES_PER_SELECTION: usize = 4;
 
 /// Text aliases offered when restoring a text entry via [`crate::clipboard::state::AppState::restore_entry`].
