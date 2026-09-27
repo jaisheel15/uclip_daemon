@@ -104,8 +104,12 @@ fn main() -> anyhow::Result<()> {
 
     // Bind first: a UI connecting during a missing-compositor failure gets a
     // typed error path later instead of connection-refused. Stale sockets
-    // from kill -9 are unlinked inside `bind`.
-    let listener = server::bind().context("bind ipc socket")?;
+    // from kill -9 are unlinked inside `bind`. `block_on` enters the reactor
+    // context tokio's `UnixListener::bind` requires; the listener is usable
+    // from any runtime thread afterwards.
+    let listener = rt
+        .block_on(async { server::bind() })
+        .context("bind ipc socket")?;
     rt.spawn(server::serve(
         listener,
         snapshot.clone(),
