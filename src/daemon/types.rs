@@ -72,7 +72,6 @@ pub enum ServerEvent {
     EntryAdded { entry: EntrySummary },
     SelectionCleared,
 }
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RequestEnvelope {
     #[serde(default = "default_version")]

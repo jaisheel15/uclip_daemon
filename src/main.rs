@@ -5,8 +5,9 @@ use tracing::info;
 use uclip_daemon::{
     AppState, ClipboardError, ReadOutcome,
     daemon::{
+        server,
         snapshot::{Snapshot, push_summary},
-        types::{EntrySummary, ServerEvent},
+        types::{EntrySummary, PendingRestore, ServerEvent},
     },
     drain_pending_reads,
 };
@@ -52,6 +53,10 @@ fn run_event_loop(
     mut state: AppState,
     snapshot: Snapshot,
     bcast_tx: tokio::sync::broadcast::Sender<ServerEvent>,
+    // P3 will poll this for UiRequest::Restore and call
+    // `state.restore_entry(id, &qh)` on this thread. Kept alive (not read)
+    // in P2 so sends never fail with a closed channel.
+    _req_rx: tokio::sync::mpsc::Receiver<PendingRestore>,
 ) -> anyhow::Result<()> {
     info!("clipboard monitor ready");
     loop {
@@ -84,12 +89,30 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    // Manual runtime (not #[tokio::main]): the Wayland loop below blocks
+    // forever on `blocking_dispatch` and must own the main thread. Runtime
+    // worker threads serve IPC; nothing Wayland-related runs on them, so no
+    // Send-bound surprises from EventQueue/Connection either.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime")?;
+
     let snapshot: Snapshot = Arc::new(std::sync::RwLock::new(Vec::new()));
     let (bcast_tx, _) = tokio::sync::broadcast::channel::<ServerEvent>(64);
+    let (req_tx, req_rx) = tokio::sync::mpsc::channel::<PendingRestore>(32);
+
+    // Bind first: a UI connecting during a missing-compositor failure gets a
+    // typed error path later instead of connection-refused. Stale sockets
+    // from kill -9 are unlinked inside `bind`.
+    let listener = server::bind().context("bind ipc socket")?;
+    rt.spawn(server::serve(
+        listener,
+        snapshot.clone(),
+        req_tx,
+        bcast_tx.clone(),
+    ));
 
     let (conn, queue, state) = setup_connection()?;
-    // NOTE(P2): adding #[tokio::main] + UnixListener later must NOT run this
-    // blocking Wayland loop on the runtime thread — move it to
-    // spawn_blocking / a dedicated OS thread then.
-    run_event_loop(conn, queue, state, snapshot.clone(), bcast_tx.clone())
+    run_event_loop(conn, queue, state, snapshot, bcast_tx, req_rx)
 }
