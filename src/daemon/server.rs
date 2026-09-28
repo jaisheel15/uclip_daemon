@@ -12,7 +12,8 @@ use tokio::{
 };
 use tokio::{
     net::UnixListener,
-    sync::{broadcast, mpsc},
+    sync::{broadcast, mpsc, oneshot},
+    time::timeout,
 };
 use tracing::{debug, error, info, warn};
 
@@ -54,6 +55,10 @@ pub fn bind() -> anyhow::Result<UnixListener, anyhow::Error> {
     Ok(listener)
 }
 
+/// How long a `Restore` request waits for the Wayland thread before the
+/// client gets a typed timeout instead of hanging forever.
+const RESTORE_TIMEOUT_SECS: u64 = 5;
+
 /// Serialize one envelope, frame with `\n`, write + flush.
 ///
 /// The trailing newline is the framing: the UI reads with `read_line()` and
@@ -89,7 +94,7 @@ async fn send_event(
 pub async fn handle_client(
     stream: tokio::net::UnixStream,
     snapshot: Snapshot,
-    _req_tx: mpsc::Sender<PendingRestore>,
+    req_tx: mpsc::Sender<PendingRestore>,
     mut bcast_rx: broadcast::Receiver<ServerEvent>,
 ) -> anyhow::Result<(), anyhow::Error> {
     let (read_half, write_half) = stream.into_split();
@@ -200,16 +205,43 @@ pub async fn handle_client(
                     }
 
                     crate::UiRequest::Restore { entry_id } => {
-                        // P3 will take `_req_tx`, forward a PendingRestore and
-                        // await the oneshot. Until then: typed stub error,
-                        // same id, no hang.
-                        warn!(entry_id, "restore requested before P3 wiring");
+                        use std::time::Duration;
+
+                        let (tx, rx) = oneshot::channel();
+                        // Bounded-32 channel: backpressure surfaces as a typed
+                        // error, never a hung client.
+                        if req_tx
+                            .send(PendingRestore { entry_id, reply: tx })
+                            .await
+                            .is_err()
+                        {
+                            let reply = ResponseEnvelope {
+                                v: 1,
+                                id: request.id,
+                                resp: DaemonResponse::Error {
+                                    message: "daemon shutting down".into(),
+                                },
+                            };
+                            if let Err(err) = send_envelope(&mut writer, &reply).await {
+                                error!("write error: {err}");
+                                return Err(err);
+                            }
+                            continue;
+                        }
+                        let resp = match timeout(Duration::from_secs(RESTORE_TIMEOUT_SECS), rx).await
+                        {
+                            Ok(Ok(r)) => r,
+                            Ok(Err(_)) => DaemonResponse::Error {
+                                message: "restore failed: wayland thread gone".into(),
+                            },
+                            Err(_) => DaemonResponse::Error {
+                                message: "restore timed out".into(),
+                            },
+                        };
                         let reply = ResponseEnvelope {
                             v: 1,
                             id: request.id,
-                            resp: DaemonResponse::Error {
-                                message: "restore not wired yet (P3)".into(),
-                            },
+                            resp,
                         };
                         if let Err(err) = send_envelope(&mut writer, &reply).await {
                             error!("write error: {err}");
@@ -526,23 +558,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restore_returns_stub_error_without_hang() {
+    async fn restore_forwards_to_wayland_thread_and_replies() {
         let snapshot = seeded_snapshot(1);
         let (bcast_tx, _) = broadcast::channel::<ServerEvent>(64);
+        let (req_tx, mut req_rx) = mpsc::channel::<PendingRestore>(8);
+        let (a, b) = UnixStream::pair().unwrap();
+        tokio::spawn(handle_client(b, snapshot, req_tx, bcast_tx.subscribe()));
+        let mut client = TestClient::new(a);
+
+        // Fake Wayland thread: answer like `handle_restore` would.
+        tokio::spawn(async move {
+            let pending = req_rx.recv().await.expect("restore forwarded");
+            assert_eq!(pending.entry_id, 7);
+            pending
+                .reply
+                .send(DaemonResponse::Restored { entry_id: 7 })
+                .unwrap();
+        });
+
+        client
+            .send(&req("rr", UiRequest::Restore { entry_id: 7 }))
+            .await;
+        let resp = client.next_response().await;
+        assert_eq!(resp.id, "rr");
+        assert_eq!(resp.resp, DaemonResponse::Restored { entry_id: 7 });
+        // Connection still alive afterwards.
+        client.send(&req("p2", UiRequest::Ping)).await;
+        let resp = client.next_response().await;
+        assert_eq!(resp.resp, DaemonResponse::Pong);
+    }
+
+    #[tokio::test]
+    async fn restore_with_closed_channel_errors_cleanly() {
+        let snapshot = seeded_snapshot(1);
+        let (bcast_tx, _) = broadcast::channel::<ServerEvent>(64);
+        // `spawn_pair` drops the receiver: every send fails closed.
         let (mut client, _req_tx) = spawn_pair(snapshot, bcast_tx);
 
         client
-            .send(&req("rr", UiRequest::Restore { entry_id: 99 }))
+            .send(&req("rr", UiRequest::Restore { entry_id: 1 }))
             .await;
         let resp = client.next_response().await;
         assert_eq!(resp.id, "rr");
         match resp.resp {
-            DaemonResponse::Error { message } => {
-                assert!(message.contains("P3"), "stub should name P3, got {message}")
-            }
-            other => panic!("expected Error stub, got {other:?}"),
+            DaemonResponse::Error { message } => assert!(
+                message.contains("shutting down"),
+                "closed channel should report shutdown, got {message}"
+            ),
+            other => panic!("expected Error, got {other:?}"),
         }
-        // Connection still alive afterwards.
         client.send(&req("p2", UiRequest::Ping)).await;
         let resp = client.next_response().await;
         assert_eq!(resp.resp, DaemonResponse::Pong);

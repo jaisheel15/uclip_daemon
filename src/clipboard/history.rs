@@ -296,6 +296,17 @@ impl ClipState {
         self.entries.iter().find(|e| e.id == id)
     }
 
+    /// Remove an entry by id. Returns true if one was removed.
+    ///
+    /// Only used by P3 echo-suppression: the compositor echoes our own
+    /// restore back, and the alias top-up makes the echo look like a new
+    /// entry. The Wayland loop drops that echo silently via this method.
+    pub fn remove(&mut self, id: u64) -> bool {
+        let before = self.entries.len();
+        self.entries.retain(|e| e.id != id);
+        self.entries.len() != before
+    }
+
     /// Log the full history at `info` level (debug helper until a TUI/GUI
     /// renders `entries` directly).
     pub fn print_history(&self) {
@@ -497,5 +508,19 @@ mod tests {
         for m in SUPPORTED_BINARY_MIMES {
             assert!(m.starts_with("image/"), "{m} should be image/*");
         }
+    }
+
+    #[test]
+    fn remove_drops_entry_by_id() {
+        let mut state = ClipState::new();
+        let a = state.add_entry("text/plain".into(), b"a".to_vec()).unwrap();
+        let b = state.add_entry("text/plain".into(), b"b".to_vec()).unwrap();
+        assert!(state.remove(a));
+        assert!(state.get(a).is_none());
+        assert_eq!(state.len(), 1);
+        assert_eq!(state.latest().unwrap().id, b);
+        // Unknown id: no-op, false.
+        assert!(!state.remove(999));
+        assert_eq!(state.len(), 1);
     }
 }

@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 wayland-client = "0.31.15"
 wayland-protocols = { version = "0.32.13", features = ["client", "staging"] }
-nix = {version = "0.31.3" , features = ["socket"  , "user"] }
+nix = {version = "0.31.3" , features = ["socket"  , "user" , "poll"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 thiserror = "2.0.21"

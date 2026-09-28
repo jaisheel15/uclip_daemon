@@ -68,43 +68,33 @@ Acceptance: P2 can serve `List` as pure `list_snapshot(&snapshot.read(), …)` w
 
 ---
 
-## P2 — Socket server (tokio, List/Ping/Subscribe live; Restore stubbed)
+## P2 — Socket server ✅ DONE
 
-Why: real IPC. `List/Ping/Subscribe` work end-to-end. `Restore` channel is defined but execution lands in P3 (Wayland-thread call).
+State: `List`/`Ping`/`Subscribe` live end-to-end; `Restore` wired through in P3 (stub replaced).
 
-### Tasks
+Shipped (deviations from plan noted):
+- `src/daemon/server.rs`: `socket_path()` (`$XDG_RUNTIME_DIR/uclip.sock`, `/tmp` fallback), sync `bind()` (mkdir parent, stale unlink, `chmod 0700`), per-client JSON-lines loop with `send_envelope`/`send_event`, `serve` accept loop (log-and-continue).
+- `src/main.rs`: manual multi-thread runtime (not `#[tokio::main]`); Wayland loop owns the main thread, IPC on workers; bind-before-Wayland-connect.
+- `PendingRestore { entry_id, reply: oneshot }` in `types.rs`, plumbed `main → serve → handle_client`.
+- 10 `server.rs` harness tests (`UnixStream::pair`: List/Ping/Restore/Subscribe, fan-out, lagged resync, malformed/oversized liveness, bind perms + rebind).
+- Verified live on Hyprland: `Ping→Pong`, `List` returns real captures, socket `srwx------`, stale rebind works.
 
-- [ ] 1. Add `src/daemon/server.rs`:
-  - `pub fn socket_path() -> PathBuf`: `$XDG_RUNTIME_DIR/uclip.sock`, fallback `/tmp/uclip-$UID.sock`.
-  - `pub async fn serve(listener: UnixListener, snapshot: Snapshot, req_tx: mpsc::Sender<PendingRestore>, bcast_tx: broadcast::Sender<ServerEvent>)`.
-  - Boot: unlink stale path, bind, `chmod 0700` (dir + sock). Bind fail = already running → exit with message.
-- [ ] 2. Per-client loop (`tokio::spawn` per accept):
-  - `BufReader` + `read_line` with `MAX_LINE_BYTES` cap (over → `Error{message: "line too long"}` + drop line).
-  - Parse `RequestEnvelope` via `serde_json::from_str`. Malformed → `ResponseEnvelope{id: <id or "">, resp: Error{…}}`, keep connection open.
-  - Dispatch:
-    - `List{offset,limit}` → `list_snapshot(&snapshot.read(), …)` → `Entries{total, entries}`.
-    - `Ping` → `Pong`.
-    - `Subscribe` → `Subscribed` ack, then spawn forward task: `bcast_tx.subscribe()` → each `ServerEvent` → `EventEnvelope{v:1,event}` + `\n`. Handle `Lagged` by resync hint (`Error` + client re-`List`s).
-    - `Restore{entry_id}` → **stub**: reply `Error{message: "restore not wired yet (P3)"}` for now, but send through `req_tx` channel shape so P3 is drop-in. Define `PendingRestore { entry_id, reply: oneshot::Sender<DaemonResponse> }` in `types.rs` or `server.rs`.
-  - Write: `serde_json::to_string(&envelope) + "\n"`, `write_all + flush`. One request per line, replies echo `id`.
-- [ ] 3. Channel defs (put in `types.rs` now so P3 needs no wire change):
-  ```rust
-  pub struct PendingRestore { pub entry_id: u64, pub reply: tokio::sync::oneshot::Sender<DaemonResponse> }
-  ```
-- [ ] 4. `src/main.rs`: `#[tokio::main]`, build snapshot + channels (P1), bind `socket_path()`, spawn `serve()` task, then run Wayland loop on current thread (or `spawn_blocking`). Keep `setup_connection()` unchanged.
-- [ ] 5. Tests:
-  - Unit: `socket_path()` respects `XDG_RUNTIME_DIR`, falls back correctly.
-  - Integration (with `tempfile` sock dir): start `serve` with empty snapshot → `List` → `total=0`; push summary → subscribed client gets `EntryAdded`; `List{0,50}` shows it; malformed line → `Error` + connection stays open; 2 concurrent subscribers both get pushes; oversized line rejected.
-- [ ] 6. Manual check:
-  ```sh
-  cargo run &
-  echo '{"v":1,"id":"r1","req":{"List":{"offset":0,"limit":50}}}' | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/uclip.sock
-  echo '{"v":1,"id":"r2","req":"Subscribe"}' | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/uclip.sock
-  # copy something in Wayland session → expect EntryAdded push
-  ```
-- [ ] 7. Verify: `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check` all clean. Kill/restart with stale sock works; perms `srwx------`.
+## P3 — Restore wiring ✅ DONE
 
-Acceptance: UI can `List` history, `Ping`, `Subscribe` to live pushes. `Restore` returns a clean unimplemented error until P3 wires it to `state.restore_entry(id, qh)` on the Wayland thread.
+State: `UiRequest::Restore` publishes the entry as the live selection end-to-end.
+
+Shipped:
+- `src/main.rs`: poll loop (`dispatch_pending` → drain → non-blocking `try_recv` → `flush` → `nix::poll` 100 ms, `EINTR`-tolerant), `qh` captured once, `handle_restore` (typed `Restored`/`Error` on the oneshot, never propagates — a bad id can't kill the daemon), expect-echo suppression (entry preview + 5 s expiry, stale-flag pruning, `is_echo` + 4 tests).
+- `src/clipboard/history.rs`: `ClipState::remove(id)` + test (echo dropped before snapshot/broadcast, so no phantom row or push).
+- `src/daemon/server.rs`: `Restore` arm (oneshot + 5 s `RESTORE_TIMEOUT_SECS` + `shutting down`/`timed out` errors, always echoing `id`); tests rewritten from stub-shape to forward-and-reply (fake Wayland consumer) + closed-channel.
+- `nix` gained the `poll` feature in `Cargo.toml`.
+- Why suppression exists: the compositor echoes our own `set_selection` back, and the `TEXT_ALIASES` top-up makes the echo's MIME set wider than the stored entry, defeating consecutive-dedup. Residual accepted risk: a byte-identical user copy within 5 s of a restore is indistinguishable from the echo (one missed row).
+
+Left for P3 sign-off (needs a compositor, headless tests can't cover `set_selection`): restore → byte-exact paste; fresh copy after restore grows history with no phantom row; bad id → `Error`; rapid-fire restores serialize with correct ids.
+
+> Historical note: the original P2 task checklist (stub-era) is superseded by
+> the sections above. The full manual socket checklist now lives in
+> `TESTING.md`.
 
 ---
 

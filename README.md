@@ -18,7 +18,7 @@ cargo run
 RUST_LOG=debug cargo run
 ```
 
-Flow in `src/main.rs`: connect → double `roundtrip` to bind seat/manager → `get_data_device` → `loop { blocking_dispatch + drain_pending_reads }`.
+Flow in `src/main.rs`: bind IPC socket → double `roundtrip` to bind seat/manager → `get_data_device` → `loop { dispatch_pending + drain_pending_reads + try_recv restores + flush + poll(100ms) }`. The Wayland loop owns the main thread; a manually built tokio runtime serves IPC on worker threads. UI protocol: newline-delimited JSON over `$XDG_RUNTIME_DIR/uclip.sock` — see `TESTING.md`.
 
 ## Test / lint
 
@@ -28,7 +28,7 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-21 unit tests: `mime::pick_mimes`, `history::ClipState` (typed Text/Image/Mixed, single-entry grouping), `io::drain_pending_reads` (incl. bounded truncation).
+50 tests: `mime::pick_mimes`, `history::ClipState` (typed Text/Image/Mixed, single-entry grouping, `remove`), `io::drain_pending_reads` (incl. bounded truncation), `daemon::types` (protocol serde), `daemon::snapshot` (paging/clamp/eviction), `daemon::server` (`UnixStream::pair` harness: List/Ping/Restore/Subscribe, fan-out, lagged resync), `main::is_echo`.
 
 ## Configuration
 
@@ -46,15 +46,19 @@ All tuning lives in `src/config.rs`:
 ## Architecture
 
 ```
-src/lib.rs            public re-exports (ClipState, AppState, pick_mimes, …)
-src/main.rs           thin bootstrap: setup_connection + run_event_loop
+src/lib.rs            public re-exports (ClipState, AppState, pick_mimes, daemon types…)
+src/main.rs           bootstrap + run_event_loop (poll loop, handle_restore, echo-suppress) + is_echo tests
 src/config.rs         tuning constants
 src/error.rs          thiserror ClipboardError (NoSeat/NoManager/NoDevice/EntryNotFound/…)
 src/mime.rs           is_text_mime + pick_mimes (single source of truth)
 src/display.rs        format_entry / format_new_entry / format_history
+src/daemon/
+  types.rs            wire protocol: UiRequest/DaemonResponse/ServerEvent envelopes + EntrySummary
+  snapshot.rs         UI mirror (Arc<RwLock<Vec<EntrySummary>>>, list_snapshot, push_summary)
+  server.rs           UnixListener bind + per-client JSON-lines loop + serve + harness tests
 src/clipboard/
-  history.rs          ClipboardContent (Text/TextData + Image/ImageData + Mixed/MixedData) + ClipboardEntry + ClipState (add_grouped: one copy == one entry, consecutive-dedup)
-  state.rs            AppState (private fields + accessors, OfferData/SourceData/PendingRead)
+  history.rs          ClipboardContent (Text/TextData + Image/ImageData + Mixed/MixedData) + ClipboardEntry + ClipState (add_grouped: one copy == one entry, consecutive-dedup, remove for echo-suppress)
+  state.rs            AppState (private fields + accessors, OfferData/SourceData/PendingRead) + restore_entry
   io.rs               drain_pending_reads -> Vec<ReadOutcome>, bounded reads, tracing only
   wayland/
     registry.rs       Dispatch<WlRegistry> (+ seat/manager bind)
@@ -72,11 +76,21 @@ Key invariants:
 
 ## Restoring history
 
+Live over IPC — no direct API needed. The UI sends one line:
+
+```json
+{"v":1,"id":"r1","req":{"Restore":{"entry_id":7}}}
+```
+
+`handle_client` forwards a `PendingRestore` over the bounded-32 `mpsc` channel; the Wayland thread picks it up within ~100 ms (`try_recv` in the poll loop) and calls:
+
 ```rust
 state.restore_entry(entry_id, &qh)?;
 ```
 
-Looks up the entry, re-offers its exact stored representations (plus `TEXT_ALIASES` top-up for text), offers each MIME, calls `set_selection`, then destroys the previous source (no selection gap). Errors as `ClipboardError::EntryNotFound / NoManager / NoDevice`. Intended UI message: `UiRequest::Restore { entry_id }` to the Wayland thread.
+Looks up the entry, re-offers its exact stored representations (plus `TEXT_ALIASES` top-up for text), offers each MIME, calls `set_selection`, then destroys the previous source (no selection gap). Replies `Restored { entry_id }`, or typed `Error` for `EntryNotFound / NoManager / NoDevice`, restore timeouts (5 s), and shutdown — always echoing the request `id`.
+
+Self-echo suppression: the compositor re-announces our own selection, and the alias top-up makes that echo look like a new entry. After a successful restore the loop arms an expect-echo flag (entry preview + 5 s expiry); the echo is dropped from history via `ClipState::remove` before snapshot/broadcast, so the UI never sees a phantom row.
 
 ## Logging
 
